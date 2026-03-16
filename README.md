@@ -33,9 +33,7 @@ Check the prerequisites before you start to ensure you have the necessary softwa
 ### Install NemoClaw and Onboard OpenClaw Agent
 
 Download and run the installer script.
-The script installs Node.js if it's not already installed.
-On GPU systems, the installer also pulls a Nemotron model through Ollama based on available VRAM.
-After installation, the script runs the guided onboard wizard to create a sandbox, configure inference, and apply security policies.
+The script installs Node.js if it is not already present, then runs the guided onboard wizard to create a sandbox, configure inference, and apply security policies.
 
 ```console
 $ git clone https://github.com/NVIDIA/openshell-openclaw-plugin.git
