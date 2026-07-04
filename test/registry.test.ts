@@ -1,12 +1,11 @@
-// @ts-nocheck
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect, beforeEach } from "vitest";
 import fs from "node:fs";
-import path from "node:path";
-import os from "node:os";
 import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
+import { beforeEach, describe, expect, it } from "vitest";
 
 // Use a temp dir so tests don't touch real ~/.nemoclaw.
 // HOME must be set before loading registry (it reads HOME at require time),
@@ -15,9 +14,41 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-test-"));
 process.env.HOME = tmpDir;
 
 const require = createRequire(import.meta.url);
-const registry = require("../dist/lib/registry");
+const registry = require("../src/lib/state/registry");
 
 const regFile = path.join(tmpDir, ".nemoclaw", "sandboxes.json");
+
+function makeMessagingPlan(
+  name: string,
+  channels: string[] = ["telegram"],
+  disabledChannels: string[] = [],
+) {
+  const disabled = new Set<string>(disabledChannels);
+  return {
+    schemaVersion: 1,
+    sandboxName: name,
+    agent: "openclaw",
+    workflow: "onboard",
+    channels: channels.map((channelId) => ({
+      channelId,
+      displayName: channelId,
+      authMode: "token-paste",
+      active: !disabled.has(channelId),
+      selected: true,
+      configured: true,
+      disabled: disabled.has(channelId),
+      inputs: [],
+      hooks: [],
+    })),
+    disabledChannels,
+    credentialBindings: [],
+    networkPolicy: { presets: [], entries: [] },
+    agentRender: [],
+    buildSteps: [],
+    stateUpdates: [],
+    healthChecks: [],
+  };
+}
 
 beforeEach(() => {
   if (fs.existsSync(regFile)) fs.unlinkSync(regFile);
@@ -38,16 +69,170 @@ describe("registry", () => {
     expect(registry.getDefault()).toBe("alpha");
   });
 
-  it("stores provided model/provider at registration time", () => {
+  it("stores durable inference metadata at registration time", () => {
     registry.registerSandbox({
       name: "alpha",
       gpuEnabled: false,
       model: "nvidia/nemotron-3-super-120b-a12b",
       provider: "nvidia-prod",
+      endpointUrl: "https://integrate.api.nvidia.com/v1",
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+      preferredInferenceApi: "openai-completions",
+      nimContainer: null,
     });
     const data = JSON.parse(fs.readFileSync(regFile, "utf-8"));
     expect(data.sandboxes.alpha.model).toBe("nvidia/nemotron-3-super-120b-a12b");
     expect(data.sandboxes.alpha.provider).toBe("nvidia-prod");
+    expect(data.sandboxes.alpha.endpointUrl).toBe("https://integrate.api.nvidia.com/v1");
+    expect(data.sandboxes.alpha.credentialEnv).toBe("NVIDIA_INFERENCE_API_KEY");
+    expect(data.sandboxes.alpha.preferredInferenceApi).toBe("openai-completions");
+    expect(data.sandboxes.alpha.nimContainer).toBeNull();
+  });
+
+  it("stores rebuild fidelity metadata at registration time", () => {
+    registry.registerSandbox({
+      name: "alpha",
+      webSearchEnabled: true,
+      fromDockerfile: "/tmp/Dockerfile.custom",
+      hermesAuthMethod: "oauth",
+    });
+    expect(registry.getSandbox("alpha")).toMatchObject({
+      webSearchEnabled: true,
+      fromDockerfile: "/tmp/Dockerfile.custom",
+      hermesAuthMethod: "oauth",
+    });
+  });
+
+  it("stores normalized compatible-endpoint reasoning state", () => {
+    registry.registerSandbox({
+      name: "alpha",
+      provider: "compatible-endpoint",
+      model: "reasoning-model",
+      endpointUrl: "https://example.test/v1",
+      compatibleEndpointReasoning: "true",
+    });
+    const data = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+    expect(data.sandboxes.alpha.compatibleEndpointReasoning).toBe("true");
+    expect(registry.getSandbox("alpha").compatibleEndpointReasoning).toBe("true");
+  });
+
+  it("persists distinct gateway bindings for two sandboxes on different ports (#4422)", () => {
+    registry.registerSandbox({
+      name: "first",
+      gatewayName: "nemoclaw",
+      gatewayPort: 8080,
+      dashboardPort: 18789,
+    });
+    registry.registerSandbox({
+      name: "second",
+      gatewayName: "nemoclaw-8081",
+      gatewayPort: 8081,
+      dashboardPort: 18790,
+    });
+    const data = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+    expect(data.sandboxes.first.gatewayName).toBe("nemoclaw");
+    expect(data.sandboxes.first.gatewayPort).toBe(8080);
+    expect(data.sandboxes.second.gatewayName).toBe("nemoclaw-8081");
+    expect(data.sandboxes.second.gatewayPort).toBe(8081);
+    // The second registration must not retarget the first sandbox's binding.
+    expect(registry.getSandbox("first").gatewayName).toBe("nemoclaw");
+    expect(registry.getSandbox("first").gatewayPort).toBe(8080);
+  });
+
+  it("registry serialization and update strip recoveredFromGateway display marker (#5714)", () => {
+    // The transient #5714 display markers must never reach sandboxes.json even
+    // if a caller force-passes one through updateSandbox(). They are not part of
+    // the durable SandboxEntry type; serializeSandboxEntryForDisk strips them.
+    registry.registerSandbox({ name: "alpha", model: "m", provider: "p" });
+    registry.updateSandbox("alpha", {
+      policies: ["npm"],
+      recoveredFromGateway: true,
+      livePhase: "Ready",
+    });
+
+    const data = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+    expect(data.sandboxes.alpha.policies).toEqual(["npm"]);
+    expect(data.sandboxes.alpha.recoveredFromGateway).toBeUndefined();
+    expect(data.sandboxes.alpha.livePhase).toBeUndefined();
+  });
+
+  it("persists MCP server state without local proxy secrets", () => {
+    registry.registerSandbox({
+      name: "alpha",
+      agent: "openclaw",
+      mcp: {
+        bridges: {
+          github: {
+            server: "github",
+            agent: "openclaw",
+            adapter: "mcporter",
+            url: "https://api.githubcopilot.com/mcp/",
+            env: ["GITHUB_TOKEN"],
+            providerName: "alpha-mcp-github",
+            providerId: "11111111-2222-4333-8444-555555555555",
+            policyName: "mcp-bridge-github",
+            addedAt: new Date(0).toISOString(),
+          },
+        },
+      },
+    });
+
+    const raw = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+    const entry = raw.sandboxes.alpha.mcp.bridges.github;
+
+    expect(entry).toMatchObject({
+      url: "https://api.githubcopilot.com/mcp/",
+      env: ["GITHUB_TOKEN"],
+      providerName: "alpha-mcp-github",
+      providerId: "11111111-2222-4333-8444-555555555555",
+      policyName: "mcp-bridge-github",
+    });
+    expect(entry.token).toBeUndefined();
+    expect(entry.command).toBeUndefined();
+    expect(entry.port).toBeUndefined();
+  });
+
+  it("normalizes MCP bridge maps by the recovered server name", () => {
+    registry.registerSandbox({
+      name: "alpha",
+      agent: "openclaw",
+      mcp: {
+        bridges: {
+          stale_key: {
+            server: "github",
+            agent: "openclaw",
+            adapter: "mcporter",
+            url: "https://api.githubcopilot.com/mcp/",
+            env: ["GITHUB_TOKEN"],
+            providerName: "alpha-mcp-github",
+            policyName: "mcp-bridge-github",
+            addedAt: new Date(0).toISOString(),
+          },
+        },
+      },
+    });
+
+    const raw = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+    expect(raw.sandboxes.alpha.mcp.bridges.github.server).toBe("github");
+    expect(raw.sandboxes.alpha.mcp.bridges.stale_key).toBeUndefined();
+  });
+
+  it("normalizes configured inference fields into a discriminated view", () => {
+    const configured = { name: "alpha", provider: "nvidia-prod", model: "nvidia/test" };
+    const missingProvider = { name: "beta", provider: null, model: "nvidia/test" };
+    const missingModel = { name: "gamma", provider: "nvidia-prod", model: null };
+    const blankProvider = { name: "delta", provider: "", model: "nvidia/test" };
+    const blankModel = { name: "epsilon", provider: "nvidia-prod", model: "   " };
+
+    expect(registry.getSandboxEntryInference(configured)).toEqual({
+      kind: "configured",
+      provider: "nvidia-prod",
+      model: "nvidia/test",
+    });
+    expect(registry.getSandboxEntryInference(missingProvider)).toEqual({ kind: "unconfigured" });
+    expect(registry.getSandboxEntryInference(missingModel)).toEqual({ kind: "unconfigured" });
+    expect(registry.getSandboxEntryInference(blankProvider)).toEqual({ kind: "unconfigured" });
+    expect(registry.getSandboxEntryInference(blankModel)).toEqual({ kind: "unconfigured" });
   });
 
   it("first registered becomes default", () => {
@@ -75,8 +260,136 @@ describe("registry", () => {
     expect(sb.model).toBe("new-model");
   });
 
+  it("persists MCP env names without raw host env values", () => {
+    registry.registerSandbox({ name: "mcp-sb", agent: "openclaw" });
+    registry.updateSandbox("mcp-sb", {
+      mcp: {
+        bridges: {
+          github: {
+            server: "github",
+            agent: "openclaw",
+            adapter: "mcporter",
+            url: "https://api.githubcopilot.com/mcp/",
+            env: ["GITHUB_TOKEN"],
+            providerName: "mcp-sb-mcp-github",
+            providerId: "11111111-2222-4333-8444-555555555555",
+            policyName: "mcp-bridge-github",
+            addedAt: new Date(0).toISOString(),
+          },
+        },
+      },
+    });
+
+    const raw = fs.readFileSync(regFile, "utf-8");
+    const data = JSON.parse(raw);
+    expect(data.sandboxes["mcp-sb"].mcp.bridges.github.env).toEqual(["GITHUB_TOKEN"]);
+    expect(data.sandboxes["mcp-sb"].mcp.bridges.github.providerName).toBe("mcp-sb-mcp-github");
+    expect(data.sandboxes["mcp-sb"].mcp.bridges.github.providerId).toBe(
+      "11111111-2222-4333-8444-555555555555",
+    );
+    expect(data.sandboxes["mcp-sb"].mcp.bridges.github.token).toBeUndefined();
+    expect(raw).not.toContain("ghp_");
+    expect(raw).not.toContain("secret-value");
+  });
+
+  it("drops invalid persisted MCP bridge entries during registry serialization", () => {
+    registry.registerSandbox({ name: "mcp-safe", agent: "openclaw" });
+    registry.updateSandbox("mcp-safe", {
+      mcp: {
+        bridges: {
+          ok: {
+            server: "ok",
+            agent: "openclaw",
+            adapter: "mcporter",
+            url: "https://api.githubcopilot.com/mcp/#ignored",
+            env: ["GITHUB_TOKEN", "GITHUB_TOKEN"],
+            providerName: "mcp-safe-mcp-ok",
+            policyName: "mcp-bridge-ok",
+            addedAt: new Date(0).toISOString(),
+          },
+          credentialUrl: {
+            server: "credentialUrl",
+            agent: "openclaw",
+            adapter: "mcporter",
+            url: "https://user:secret@example.test/mcp",
+            env: ["TOKEN"],
+            providerName: "mcp-safe-mcp-credential",
+            policyName: "mcp-bridge-credential",
+            addedAt: new Date(0).toISOString(),
+          },
+          privateIp: {
+            server: "privateIp",
+            agent: "openclaw",
+            adapter: "mcporter",
+            url: "http://127.0.0.1:31337/mcp",
+            env: ["TOKEN"],
+            providerName: "mcp-safe-mcp-private",
+            policyName: "mcp-bridge-private",
+            addedAt: new Date(0).toISOString(),
+          },
+          invalidEnv: {
+            server: "invalidEnv",
+            agent: "openclaw",
+            adapter: "mcporter",
+            url: "https://api.githubcopilot.com/mcp/",
+            env: ["TOKEN=secret"],
+            providerName: "mcp-safe-mcp-invalid-env",
+            policyName: "mcp-bridge-invalid-env",
+            addedAt: new Date(0).toISOString(),
+          },
+          unknownAdapter: {
+            server: "unknownAdapter",
+            agent: "openclaw",
+            adapter: "unknown",
+            url: "https://api.githubcopilot.com/mcp/",
+            env: ["TOKEN"],
+            providerName: "mcp-safe-mcp-unknown",
+            policyName: "mcp-bridge-unknown",
+            addedAt: new Date(0).toISOString(),
+          },
+          invalidProviderId: {
+            server: "invalidProviderId",
+            agent: "openclaw",
+            adapter: "mcporter",
+            url: "https://api.githubcopilot.com/mcp/",
+            env: ["TOKEN"],
+            providerName: "mcp-safe-mcp-invalid-provider-id",
+            providerId: "invalid provider id",
+            policyName: "mcp-bridge-invalid-provider-id",
+            addedAt: new Date(0).toISOString(),
+          },
+          oversizedUrl: {
+            server: "oversizedUrl",
+            agent: "openclaw",
+            adapter: "mcporter",
+            url: `https://api.githubcopilot.com/${"a".repeat(2_048)}`,
+            env: ["TOKEN"],
+            providerName: "mcp-safe-mcp-oversized",
+            policyName: "mcp-bridge-oversized",
+            addedAt: new Date(0).toISOString(),
+          },
+        },
+      },
+    });
+
+    const bridges = registry.getSandbox("mcp-safe").mcp.bridges;
+    expect(Object.keys(bridges)).toEqual(["ok"]);
+    expect(bridges.ok.url).toBe("https://api.githubcopilot.com/mcp/");
+    expect(bridges.ok.env).toEqual(["GITHUB_TOKEN"]);
+  });
+
   it("updateSandbox returns false for nonexistent sandbox", () => {
     expect(registry.updateSandbox("nope", {})).toBe(false);
+  });
+
+  it("registerSandbox does not inherit a finalized policy marker (#4621)", () => {
+    // Snapshot restore spreads the source entry (possibly finalized) but resets
+    // policies; the clone must not carry a stale finalized marker.
+    registry.registerSandbox({ name: "clone", policies: [], policyPresetsFinalized: true });
+    expect(registry.getSandbox("clone").policyPresetsFinalized).toBeUndefined();
+    // The marker is set only by the post-policy registry write.
+    registry.updateSandbox("clone", { policyPresetsFinalized: true });
+    expect(registry.getSandbox("clone").policyPresetsFinalized).toBe(true);
   });
 
   it("updateSandbox rejects name changes", () => {
@@ -164,6 +477,101 @@ describe("registry", () => {
     expect(data.sandboxes.tagged.imageTag).toBe("openshell/sandbox-from:1776766054");
   });
 
+  it("stores messaging plan state at registration time", () => {
+    const basePlan = makeMessagingPlan("messaging", ["telegram"]);
+    const plan = {
+      ...basePlan,
+      channels: [
+        {
+          ...basePlan.channels[0],
+          inputs: [
+            {
+              channelId: "telegram",
+              inputId: "botToken",
+              kind: "secret",
+              required: true,
+              sourceEnv: "TELEGRAM_BOT_TOKEN",
+              credentialAvailable: true,
+            },
+          ],
+        },
+      ],
+      credentialBindings: [
+        {
+          channelId: "telegram",
+          credentialId: "telegramBotToken",
+          sourceInput: "botToken",
+          providerName: "messaging-telegram-bridge",
+          providerEnvKey: "TELEGRAM_BOT_TOKEN",
+          placeholder: "openshell:resolve:env:TELEGRAM_BOT_TOKEN",
+          credentialAvailable: true,
+          credentialHash: "hash",
+        },
+      ],
+    };
+    registry.registerSandbox({
+      name: "messaging",
+      messaging: { schemaVersion: 1, plan },
+    });
+
+    const sb = registry.getSandbox("messaging");
+    expect(sb.messaging).toMatchObject({
+      schemaVersion: 1,
+      plan: {
+        schemaVersion: 1,
+        sandboxName: "messaging",
+        channels: [expect.objectContaining({ channelId: "telegram", active: true })],
+      },
+    });
+    const rawSandbox = sb as unknown as Record<string, unknown>;
+    expect(rawSandbox.messagingChannels).toBeUndefined();
+    expect(rawSandbox.messagingChannelConfig).toBeUndefined();
+    expect(registry.getConfiguredMessagingChannels("messaging")).toEqual(["telegram"]);
+    const hydrated = registry.getHydratedMessagingPlanFromEntry(sb);
+    expect(
+      hydrated.agentRender.some((entry: { channelId: string }) => entry.channelId === "telegram"),
+    ).toBe(true);
+    expect(
+      hydrated.channels[0].hooks.some(
+        (hook: { channelId: string }) => hook.channelId === "telegram",
+      ),
+    ).toBe(true);
+    const data = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+    expect(data.sandboxes.messaging.messaging.schemaVersion).toBe(1);
+    expect(data.sandboxes.messaging.messaging.plan).toMatchObject({
+      schemaVersion: 1,
+      sandboxName: "messaging",
+      channels: [{ channelId: "telegram" }],
+    });
+    expect(data.sandboxes.messaging.messaging.plan.networkPolicy).toEqual({
+      presets: [],
+      entries: [],
+    });
+    expect(data.sandboxes.messaging.messaging.plan.agentRender).toBeUndefined();
+    expect(data.sandboxes.messaging.messaging.plan.buildSteps).toBeUndefined();
+    expect(data.sandboxes.messaging.messaging.plan.runtimeSetup).toBeUndefined();
+    expect(data.sandboxes.messaging.messaging.plan.stateUpdates).toBeUndefined();
+    expect(data.sandboxes.messaging.messaging.plan.healthChecks).toBeUndefined();
+    expect(data.sandboxes.messaging.messaging.plan.channels[0]).toEqual({
+      channelId: "telegram",
+      active: true,
+      configured: true,
+      disabled: false,
+      inputs: [{ inputId: "botToken", credentialAvailable: true }],
+    });
+    expect(data.sandboxes.messaging.messaging.plan.channels[0].hooks).toBeUndefined();
+    expect(data.sandboxes.messaging.messaging.plan.credentialBindings).toEqual([
+      {
+        channelId: "telegram",
+        providerEnvKey: "TELEGRAM_BOT_TOKEN",
+        credentialAvailable: true,
+        credentialHash: "hash",
+      },
+    ]);
+    expect(data.sandboxes.messaging.messagingChannels).toBeUndefined();
+    expect(data.sandboxes.messaging.messagingChannelConfig).toBeUndefined();
+  });
+
   it("imageTag defaults to null when not provided", () => {
     registry.registerSandbox({ name: "no-tag" });
     const sb = registry.getSandbox("no-tag");
@@ -184,8 +592,32 @@ describe("registry", () => {
     expect(sandboxes.length).toBe(0);
   });
 
+  it("skips malformed sandbox entries while loading the registry", () => {
+    fs.mkdirSync(path.dirname(regFile), { recursive: true });
+    fs.writeFileSync(
+      regFile,
+      JSON.stringify({
+        defaultSandbox: "broken",
+        sandboxes: {
+          good: { name: "good", model: "m1" },
+          broken: null,
+          text: "not-an-entry",
+        },
+      }),
+    );
+
+    expect(registry.getSandbox("broken")).toBe(null);
+    expect(registry.getDefault()).toBe("good");
+    expect(
+      registry.listSandboxes().sandboxes.map((sandbox: { name: string }) => sandbox.name),
+    ).toEqual(["good"]);
+  });
+
   it("setChannelDisabled toggles a channel on and off for a sandbox", () => {
-    registry.registerSandbox({ name: "s1" });
+    registry.registerSandbox({
+      name: "s1",
+      messaging: { schemaVersion: 1, plan: makeMessagingPlan("s1", ["telegram", "discord"]) },
+    });
     expect(registry.getDisabledChannels("s1")).toEqual([]);
 
     expect(registry.setChannelDisabled("s1", "telegram", true)).toBe(true);
@@ -198,12 +630,25 @@ describe("registry", () => {
     expect(registry.getDisabledChannels("s1")).toEqual(["discord"]);
   });
 
-  it("setChannelDisabled clears the disabledChannels field when empty", () => {
-    registry.registerSandbox({ name: "s1" });
+  it("setChannelDisabled clears plan.disabledChannels when empty", () => {
+    registry.registerSandbox({
+      name: "s1",
+      messaging: { schemaVersion: 1, plan: makeMessagingPlan("s1", ["telegram"]) },
+    });
     registry.setChannelDisabled("s1", "telegram", true);
     registry.setChannelDisabled("s1", "telegram", false);
     const persisted = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+    expect(persisted.sandboxes.s1.messaging.plan.disabledChannels).toEqual([]);
     expect(persisted.sandboxes.s1.disabledChannels).toBeUndefined();
+  });
+
+  it("setChannelDisabled returns false when the channel is not configured in the plan", () => {
+    registry.registerSandbox({
+      name: "s1",
+      messaging: { schemaVersion: 1, plan: makeMessagingPlan("s1", ["telegram"]) },
+    });
+    expect(registry.setChannelDisabled("s1", "discord", true)).toBe(false);
+    expect(registry.getDisabledChannels("s1")).toEqual([]);
   });
 
   it("setChannelDisabled returns false when sandbox is missing", () => {
@@ -211,13 +656,89 @@ describe("registry", () => {
   });
 
   it("registerSandbox preserves disabledChannels when re-registering", () => {
-    registry.registerSandbox({ name: "s1" });
+    registry.registerSandbox({
+      name: "s1",
+      messaging: { schemaVersion: 1, plan: makeMessagingPlan("s1", ["telegram"]) },
+    });
     registry.setChannelDisabled("s1", "telegram", true);
     registry.registerSandbox({
       name: "s1",
-      disabledChannels: registry.getDisabledChannels("s1"),
+      messaging: registry.getSandbox("s1").messaging,
     });
     expect(registry.getDisabledChannels("s1")).toEqual(["telegram"]);
+  });
+
+  it("addCustomPolicy persists name, content, and sourcePath", () => {
+    registry.registerSandbox({ name: "cp1" });
+    const added = registry.addCustomPolicy("cp1", {
+      name: "my-api",
+      content: "preset:\n  name: my-api\nnetwork_policies: {}\n",
+      sourcePath: "/tmp/my-api.yaml",
+    });
+    expect(added).toBe(true);
+    const list = registry.getCustomPolicies("cp1");
+    expect(list.length).toBe(1);
+    expect(list[0].name).toBe("my-api");
+    expect(list[0].content).toMatch(/name: my-api/);
+    expect(list[0].sourcePath).toBe("/tmp/my-api.yaml");
+    expect(typeof list[0].appliedAt).toBe("string");
+  });
+
+  it("addCustomPolicy replaces an existing entry with the same name", () => {
+    registry.registerSandbox({ name: "cp2" });
+    registry.addCustomPolicy("cp2", { name: "dup", content: "v1" });
+    registry.addCustomPolicy("cp2", { name: "dup", content: "v2" });
+    const list = registry.getCustomPolicies("cp2");
+    expect(list.length).toBe(1);
+    expect(list[0].content).toBe("v2");
+  });
+
+  it("removeCustomPolicyByName removes an entry and returns true", () => {
+    registry.registerSandbox({ name: "cp3" });
+    registry.addCustomPolicy("cp3", { name: "a", content: "x" });
+    registry.addCustomPolicy("cp3", { name: "b", content: "y" });
+    expect(registry.removeCustomPolicyByName("cp3", "a")).toBe(true);
+    const list = registry.getCustomPolicies("cp3");
+    expect(list.length).toBe(1);
+    expect(list[0].name).toBe("b");
+  });
+
+  it("removeCustomPolicyByName returns false when the entry is missing", () => {
+    registry.registerSandbox({ name: "cp4" });
+    expect(registry.removeCustomPolicyByName("cp4", "nope")).toBe(false);
+  });
+
+  it("getCustomPolicies returns [] for unknown or fresh sandboxes", () => {
+    expect(registry.getCustomPolicies("nonexistent")).toEqual([]);
+    registry.registerSandbox({ name: "cp5" });
+    expect(registry.getCustomPolicies("cp5")).toEqual([]);
+  });
+
+  describe("extra providers", () => {
+    it("starts with an empty extra-provider list", () => {
+      expect(registry.listExtraProviders()).toEqual([]);
+    });
+
+    it("addExtraProvider persists a sorted, deduplicated list", () => {
+      expect(registry.addExtraProvider("tavily-search")).toBe(true);
+      expect(registry.addExtraProvider("custom-provider")).toBe(true);
+      expect(registry.addExtraProvider("tavily-search")).toBe(false);
+      expect(registry.listExtraProviders()).toEqual(["custom-provider", "tavily-search"]);
+    });
+
+    it("removeExtraProvider clears the entry and drops the field when empty", () => {
+      registry.addExtraProvider("tavily-search");
+      expect(registry.removeExtraProvider("tavily-search")).toBe(true);
+      expect(registry.listExtraProviders()).toEqual([]);
+      const raw = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+      expect("extraProviders" in raw).toBe(false);
+      expect(registry.removeExtraProvider("tavily-search")).toBe(false);
+    });
+
+    it("survives a registry round-trip through disk", () => {
+      registry.addExtraProvider("tavily-search");
+      expect(registry.listExtraProviders()).toEqual(["tavily-search"]);
+    });
   });
 });
 
@@ -357,7 +878,7 @@ describe("advisory file locking", () => {
   it("concurrent writers do not corrupt the registry", () => {
     const { spawnSync } = require("child_process");
     const registryPath = path.resolve(
-      path.join(import.meta.dirname, "..", "dist", "lib", "registry.js"),
+      path.join(import.meta.dirname, "..", "src", "lib", "state", "registry.ts"),
     );
     const homeDir = path.dirname(path.dirname(regFile));
     // Script that spawns 4 workers in parallel, each writing 5 sandboxes

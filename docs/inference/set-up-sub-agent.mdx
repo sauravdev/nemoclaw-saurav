@@ -1,0 +1,191 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Set Up Task-Specific Sub-Agents"
+sidebar-title: "Set Up Task-Specific Sub-Agents"
+description: "Where NemoClaw stores OpenClaw sub-agent model configuration, credentials, and workspace files inside the sandbox."
+description-agent: "Shows the NemoClaw-specific file paths and update flow for adding an auxiliary OpenClaw sub-agent model. Use when users ask how to add a second model, configure a sub-agent model, use Omni for vision tasks, configure agents.list, or use sessions_spawn in NemoClaw."
+keywords: ["nemoclaw additional model", "nemoclaw sub-agent model", "openclaw sub-agent", "agents.list", "sessions_spawn", "vlm-demo"]
+content:
+  type: "how_to"
+skill:
+  priority: 30
+---
+OpenClaw documents the sub-agent behavior, `sessions_spawn` tool, `agents.list` configuration, tool policy, nesting, and auth model in [Sub-Agents](https://docs.openclaw.ai/tools/subagents).
+Use that page as the source of truth for how OpenClaw sub-agents work.
+
+This page covers the sandbox-specific pieces: where the OpenClaw config lives, where to put per-agent credentials, which writable workspace path agents should use, and how the Omni VLM demo maps onto those paths.
+
+## NemoClaw Sandbox Paths
+
+NemoClaw runs OpenClaw inside an OpenShell sandbox.
+When adapting an OpenClaw sub-agent setup, use these paths inside the sandbox:
+
+| Path | Purpose |
+|---|---|
+| `/sandbox/.openclaw/openclaw.json` | OpenClaw config, including `models.providers`, `agents.defaults`, and `agents.list`. |
+| `/sandbox/.openclaw/.config-hash` | Hash for `openclaw.json`. Keep it in sync after manual config edits so OpenClaw can detect the updated config. |
+| `/sandbox/.openclaw/agents/<agent-id>/agent/auth-profiles.json` | Per-agent provider credentials. Use this when a sub-agent calls an auxiliary provider directly. |
+| `/sandbox/.openclaw/workspace/` | Writable shared workspace path for files the primary agent passes to the sub-agent. |
+| `/tmp/gateway.log` | OpenClaw gateway log. Use it to confirm config reloads and diagnose sub-agent failures. |
+
+For file-based tasks, instruct agents to use `/sandbox/.openclaw/workspace/`.
+Avoid relying on legacy `.openclaw-data` paths or read-only OpenClaw paths in delegation instructions.
+
+## Omni Vision Sub-Agent Example
+
+The [`vlm-demo`](https://github.com/brevdev/nemoclaw-demos/tree/main/vlm-demo) applies the OpenClaw sub-agent pattern to a vision task.
+It keeps the primary `main` agent on the normal NemoClaw inference route and adds a `vision-operator` sub-agent backed by an Omni vision model.
+
+| OpenClaw field | Omni example value |
+|---|---|
+| Primary agent | `main` |
+| Primary model | `inference/nvidia/nemotron-3-super-120b-a12b` |
+| Auxiliary provider | `nvidia-omni` |
+| Sub-agent | `vision-operator` |
+| Sub-agent model | `nvidia-omni/private/nvidia/nemotron-3-nano-omni-reasoning-30b-a3b` |
+| Delegation tool | `sessions_spawn` |
+
+The sub-agent uses Omni as the specialist model for image tasks.
+The primary orchestration model remains responsible for conversation, planning, and deciding when to delegate.
+
+## Update the Sandbox Config
+
+<Note>
+Finish the [Quickstart](../get-started/quickstart) and start the target sandbox before you run the `docker exec` commands in this section.
+These commands run on the host that owns the sandbox containers and discover the running sandbox container from the `openshell.ai/sandbox-name` Docker label.
+If you have not created a sandbox yet, onboard one first, such as `my-assistant`.
+</Note>
+
+Fetch the current OpenClaw config from the sandbox, patch it with your auxiliary provider and `agents.list` changes, then upload it.
+On Docker-driver sandboxes, run these commands from the host that owns the sandbox containers.
+The container name includes a runtime suffix, so discover it from the OpenShell sandbox label:
+
+```bash
+export SANDBOX=my-assistant
+export SANDBOX_CTR=$(docker ps --filter "label=openshell.ai/sandbox-name=$SANDBOX" --format "{{.Names}}" | sed -n '1p')
+if [ -z "$SANDBOX_CTR" ]; then
+  echo "No running sandbox container found for $SANDBOX. Start the sandbox before editing its config."
+  exit 1
+fi
+docker exec --user root "$SANDBOX_CTR" cat /sandbox/.openclaw/openclaw.json > /tmp/openclaw.json
+```
+
+If `SANDBOX_CTR` is empty, the sandbox is not running on this host.
+Start the sandbox, confirm that `docker ps` shows the matching `openshell.ai/sandbox-name` label, then rerun the export commands before continuing.
+
+Create `/tmp/openclaw.updated.json` with the OpenClaw sub-agent config.
+For the Omni example, the demo provides `vlm-demo/vlm-subagent/openclaw-patch.py`.
+Set `VLM_DEMO_DIR` to the local `vlm-demo` directory from the demo assets, then run the patch helper:
+
+```bash
+export VLM_DEMO_DIR=/path/to/nemoclaw-demos/vlm-demo
+python3 "$VLM_DEMO_DIR/vlm-subagent/openclaw-patch.py" "$NVIDIA_API_KEY" < /tmp/openclaw.json > /tmp/openclaw.updated.json
+```
+
+The helper reads `/tmp/openclaw.json` from standard input, adds the Omni provider and `vision-operator` entry, and writes the patched config to `/tmp/openclaw.updated.json`.
+For a sub-agent other than the Omni example, create `/tmp/openclaw.updated.json` from the exported config with `cp /tmp/openclaw.json /tmp/openclaw.updated.json`, then edit it before the upload step with your provider under `models.providers` and your sub-agent under `agents`.
+Do not commit `/tmp/openclaw.updated.json` or any other file that contains a real API key.
+
+Upload the patched config and refresh the hash.
+In the default mutable state, this keeps the local hash consistent but does not make it tamper-proof.
+Use NemoClaw runtime controls when the sandbox needs a hardened config posture after the manual edit.
+
+```bash
+docker exec --user root "$SANDBOX_CTR" chmod 644 /sandbox/.openclaw/openclaw.json
+docker exec --user root "$SANDBOX_CTR" chmod 644 /sandbox/.openclaw/.config-hash
+docker exec --user root -i "$SANDBOX_CTR" sh -c 'cat > /sandbox/.openclaw/openclaw.json' < /tmp/openclaw.updated.json
+docker exec --user root "$SANDBOX_CTR" /bin/bash -c "cd /sandbox/.openclaw && sha256sum openclaw.json > .config-hash"
+docker exec --user root "$SANDBOX_CTR" chown sandbox:sandbox /sandbox/.openclaw/openclaw.json /sandbox/.openclaw/.config-hash
+docker exec --user root "$SANDBOX_CTR" chmod 444 /sandbox/.openclaw/openclaw.json
+docker exec --user root "$SANDBOX_CTR" chmod 444 /sandbox/.openclaw/.config-hash
+```
+
+Check `/tmp/gateway.log` after upload and confirm the gateway hot-reloaded the provider or `agents.list` change:
+
+```bash
+nemoclaw "$SANDBOX" logs --since 5m --tail 200
+nemoclaw "$SANDBOX" agents list --json
+```
+
+Expected output:
+
+```text
+config change detected; evaluating reload (...)
+config hot reload applied (...)
+```
+
+The `agents list` output should include `vision-operator`.
+
+## Add Sub-Agent Credentials
+
+If the auxiliary model uses a provider key outside the normal NemoClaw inference route, put that key in the sub-agent auth profile.
+For the Omni example:
+
+```text
+/sandbox/.openclaw/agents/vision-operator/agent/auth-profiles.json
+```
+
+Use the same provider ID that appears in `models.providers`, such as `nvidia-omni`.
+Create `/tmp/auth-profiles.json` from `vlm-demo/vlm-subagent/auth-profiles.template.json`, replace `YOUR_NVIDIA_API_KEY_HERE` with the provider key, then upload it into the sandbox:
+
+```bash
+docker exec --user root "$SANDBOX_CTR" mkdir -p /sandbox/.openclaw/agents/vision-operator/agent
+docker exec --user root -i "$SANDBOX_CTR" sh -c 'cat > /sandbox/.openclaw/agents/vision-operator/agent/auth-profiles.json' < /tmp/auth-profiles.json
+docker exec --user root "$SANDBOX_CTR" chmod 600 /sandbox/.openclaw/agents/vision-operator/agent/auth-profiles.json
+```
+
+After uploading the auth profile, make sure the sandbox user owns the sub-agent directory:
+
+```bash
+docker exec --user root "$SANDBOX_CTR" chown -R sandbox:sandbox /sandbox/.openclaw/agents/vision-operator
+```
+
+## Allow Auxiliary Provider Egress
+
+If the sub-agent calls a provider directly, update the OpenShell network policy for the binary that makes the request.
+In the Omni demo, the OpenClaw gateway runs as `/usr/local/bin/node`, so the NVIDIA endpoint policy must allow that binary.
+
+Refer to [Customize the Network Policy](../network-policy/customize-network-policy) for policy update workflows.
+
+## Sub-Agent Gateway Connectivity
+
+Spawned sub-agents connect back to the OpenClaw gateway over WebSocket at `OPENCLAW_GATEWAY_URL`.
+Inside the sandbox this connection runs through the enforced process tree, where the OpenShell proxy always blocks loopback destinations.
+NemoClaw therefore points `OPENCLAW_GATEWAY_URL` at the sandbox's own interface address (for example `ws://10.200.0.2:18790`) and allowlists that endpoint in the base sandbox policy (`openclaw_gateway_dialback`).
+
+If `sessions_spawn` returns `gateway closed (1006 abnormal closure (no close frame))` and the gateway log shows no connection attempt, the dial-back path is blocked.
+Check the following:
+
+1. `OPENCLAW_GATEWAY_URL` in the gateway process environment targets the sandbox interface address, not `127.0.0.1`.
+2. The active policy allows that address and port. Custom `NEMOCLAW_DASHBOARD_PORT` or proxy subnet values need a matching `openshell policy update`.
+3. Do not point the dial-back at `127.0.0.1`; the proxy denies loopback regardless of policy.
+
+## Add Delegation Instructions
+
+OpenClaw handles `sessions_spawn`, but the primary agent still needs task instructions.
+Place those instructions in the writable workspace, for example:
+
+```text
+/sandbox/.openclaw/workspace/TOOLS.md
+```
+
+The Omni demo includes `vlm-demo/vlm-subagent/TOOLS.md`, which tells `main` to delegate image tasks to `vision-operator` and tells the sub-agent to read the image path it receives.
+Adapt that file for other task-specific models.
+
+## Demo Assets
+
+Use the [`vlm-demo`](https://github.com/brevdev/nemoclaw-demos/tree/main/vlm-demo) repository for runnable Omni assets:
+
+- `vlm-subagent-guide.md` for a command-by-command walkthrough.
+- `vlm-subagent/openclaw-patch.py` for patching `openclaw.json`.
+- `vlm-subagent/auth-profiles.template.json` for the sub-agent auth profile.
+- `vlm-subagent/TOOLS.md` for delegation instructions.
+
+## Next Steps
+
+Continue with these resources:
+
+- Refer to [OpenClaw Sub-Agents](https://docs.openclaw.ai/tools/subagents) for `sessions_spawn`, `agents.list`, nesting, tool policy, and auth behavior.
+- Refer to [Switch Inference Providers](switch-inference-providers) to change the primary orchestration model instead of adding a sub-agent model.
+- Refer to [Workspace Files](../manage-sandboxes/workspace-files) to understand per-agent workspace directories.

@@ -3,6 +3,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   describeOnboardEndpoint,
   describeOnboardProvider,
@@ -44,7 +45,7 @@ function makeConfig(overrides: Partial<NemoClawOnboardConfig> = {}): NemoClawOnb
     ncpPartner: null,
     model: "nvidia/nemotron-3-super-120b-a12b",
     profile: "default",
-    credentialEnv: "NVIDIA_API_KEY",
+    credentialEnv: "NVIDIA_INFERENCE_API_KEY",
     onboardedAt: "2026-03-01T00:00:00.000Z",
     ...overrides,
   };
@@ -145,9 +146,36 @@ describe("onboard/config", () => {
 
     it("returns parsed config when file exists", () => {
       const config = makeConfig();
-      const configPath = `${homedir()}/.nemoclaw/config.json`;
+      const configPath = join(homedir(), ".nemoclaw", "config.json");
       store.set(configPath, JSON.stringify(config));
       expect(loadOnboardConfig()).toEqual(config);
+    });
+
+    it("returns null when the parsed JSON root is not a valid onboard config", () => {
+      const configPath = join(homedir(), ".nemoclaw", "config.json");
+      store.set(configPath, JSON.stringify({ endpointType: "bogus" }));
+      expect(loadOnboardConfig()).toBeNull();
+    });
+
+    it("returns null without throwing for an empty (0-byte) config file", () => {
+      const configPath = join(homedir(), ".nemoclaw", "config.json");
+      store.set(configPath, "");
+      expect(() => loadOnboardConfig()).not.toThrow();
+      expect(loadOnboardConfig()).toBeNull();
+    });
+
+    it("returns null without throwing for a whitespace-only config file", () => {
+      const configPath = join(homedir(), ".nemoclaw", "config.json");
+      store.set(configPath, "  \n\t  ");
+      expect(() => loadOnboardConfig()).not.toThrow();
+      expect(loadOnboardConfig()).toBeNull();
+    });
+
+    it("returns null without throwing for malformed JSON", () => {
+      const configPath = join(homedir(), ".nemoclaw", "config.json");
+      store.set(configPath, "{ not json");
+      expect(() => loadOnboardConfig()).not.toThrow();
+      expect(loadOnboardConfig()).toBeNull();
     });
   });
 

@@ -185,6 +185,18 @@ function loadConfigDocument(configPath: string): OpenClawConfigDocument | null {
     return null;
   }
   const raw = readFileSync(configPath, "utf-8");
+  // Empty / whitespace-only openclaw.json — the upstream openshell-inference-set
+  // truncate-then-write window can leave the file at 0 bytes (#3118). JSON5.parse
+  // would throw "JSON5: invalid end of input at 1:1"; surface a recovery hint
+  // instead so callers can route the user to the restart-recovery path rather
+  // than chasing the parser error.
+  if (raw.trim() === "") {
+    throw new Error(
+      `Config at ${configPath} is empty (0 bytes or whitespace-only). ` +
+        "Restart the sandbox to trigger baseline recovery, or restore the " +
+        "file from a known-good copy (see #3118).",
+    );
+  }
   return parseConfigDocument(JSON5.parse(raw), `Config at ${configPath}`);
 }
 
@@ -593,10 +605,51 @@ function writeSnapshotManifest(snapshotDir: string, manifest: SnapshotManifest):
   writeFileSync(path.join(snapshotDir, "snapshot.json"), JSON.stringify(manifest, null, 2));
 }
 
+function isMigrationRootBinding(value: unknown): value is MigrationRootBinding {
+  return isRecord(value) && typeof value.configPath === "string";
+}
+
+function isMigrationExternalRoot(value: unknown): value is MigrationExternalRoot {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    (value.kind === "workspace" || value.kind === "agentDir" || value.kind === "skillsExtraDir") &&
+    typeof value.label === "string" &&
+    typeof value.sourcePath === "string" &&
+    typeof value.snapshotRelativePath === "string" &&
+    typeof value.sandboxPath === "string" &&
+    Array.isArray(value.symlinkPaths) &&
+    value.symlinkPaths.every((entry) => typeof entry === "string") &&
+    Array.isArray(value.bindings) &&
+    value.bindings.every((entry) => isMigrationRootBinding(entry))
+  );
+}
+
+function isSnapshotManifest(value: unknown): value is SnapshotManifest {
+  return (
+    isRecord(value) &&
+    typeof value.version === "number" &&
+    typeof value.createdAt === "string" &&
+    typeof value.homeDir === "string" &&
+    typeof value.stateDir === "string" &&
+    (value.configPath === null || typeof value.configPath === "string") &&
+    typeof value.hasExternalConfig === "boolean" &&
+    Array.isArray(value.externalRoots) &&
+    value.externalRoots.every((entry) => isMigrationExternalRoot(entry)) &&
+    Array.isArray(value.warnings) &&
+    value.warnings.every((entry) => typeof entry === "string") &&
+    (value.blueprintDigest === undefined ||
+      value.blueprintDigest === null ||
+      typeof value.blueprintDigest === "string")
+  );
+}
+
 function readSnapshotManifest(snapshotDir: string): SnapshotManifest {
-  return JSON.parse(
-    readFileSync(path.join(snapshotDir, "snapshot.json"), "utf-8"),
-  ) as SnapshotManifest;
+  const raw: unknown = JSON.parse(readFileSync(path.join(snapshotDir, "snapshot.json"), "utf-8"));
+  if (!isSnapshotManifest(raw)) {
+    throw new Error(`Invalid snapshot manifest at ${path.join(snapshotDir, "snapshot.json")}`);
+  }
+  return raw;
 }
 
 function resolveConfigSourcePath(manifest: SnapshotManifest, snapshotDir: string): string {
@@ -608,12 +661,26 @@ function resolveConfigSourcePath(manifest: SnapshotManifest, snapshotDir: string
 
 const UNSAFE_PROPERTY_NAMES = new Set(["__proto__", "constructor", "prototype"]);
 
+function isArrayIndexToken(token: string): boolean {
+  return /^\d+$/.test(token);
+}
+
+function requireArray(value: unknown, configPath: string): unknown[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`Invalid config path segment in ${configPath}`);
+  }
+  return value;
+}
+
+function requireRecord(value: unknown, configPath: string): UnknownRecord {
+  if (!isRecord(value)) {
+    throw new Error(`Invalid config path segment in ${configPath}`);
+  }
+  return value;
+}
+
 /** @visibleForTesting */
-export function setConfigValue(
-  document: Record<string, unknown>,
-  configPath: string,
-  value: string,
-): void {
+export function setConfigValue(document: UnknownRecord, configPath: string, value: string): void {
   const tokens = configPath.match(/[^.[\]]+/g);
   if (!tokens || tokens.length === 0) {
     throw new Error(`Invalid config path: ${configPath}`);
@@ -632,21 +699,21 @@ export function setConfigValue(
     if (!token || !nextToken) {
       throw new Error(`Invalid config path segment in ${configPath}`);
     }
-    const isArrayIndex = /^\d+$/.test(token);
+    const isArrayIndex = isArrayIndexToken(token);
 
     if (isArrayIndex) {
-      const array = current as unknown[];
-      const entry = array[Number.parseInt(token, 10)];
-      if (entry == null) {
-        array[Number.parseInt(token, 10)] = /^\d+$/.test(nextToken) ? [] : {};
+      const array = requireArray(current, configPath);
+      const arrayIndex = Number.parseInt(token, 10);
+      if (array[arrayIndex] == null) {
+        array[arrayIndex] = isArrayIndexToken(nextToken) ? [] : {};
       }
-      current = array[Number.parseInt(token, 10)];
+      current = array[arrayIndex];
       continue;
     }
 
-    const record = current as Record<string, unknown>;
+    const record = requireRecord(current, configPath);
     if (!record[token] || typeof record[token] !== "object") {
-      record[token] = /^\d+$/.test(nextToken) ? [] : {};
+      record[token] = isArrayIndexToken(nextToken) ? [] : {};
     }
     current = record[token];
   }
@@ -655,12 +722,13 @@ export function setConfigValue(
   if (!finalToken) {
     throw new Error(`Missing final config path segment in ${configPath}`);
   }
-  if (/^\d+$/.test(finalToken)) {
-    const array = current as unknown[];
+  if (isArrayIndexToken(finalToken)) {
+    const array = requireArray(current, configPath);
     array[Number.parseInt(finalToken, 10)] = value;
     return;
   }
-  (current as Record<string, unknown>)[finalToken] = value;
+  const record = requireRecord(current, configPath);
+  record[finalToken] = value;
 }
 
 function prepareSandboxState(snapshotDir: string, manifest: SnapshotManifest): string {
@@ -679,7 +747,7 @@ function prepareSandboxState(snapshotDir: string, manifest: SnapshotManifest): s
   }
 
   // Strip gateway config (contains auth tokens) — sandbox entrypoint regenerates it
-  delete (config as Record<string, unknown>)["gateway"];
+  delete config["gateway"];
 
   const configPath = path.join(preparedStateDir, "openclaw.json");
   writeFileSync(configPath, JSON.stringify(config, null, 2));
