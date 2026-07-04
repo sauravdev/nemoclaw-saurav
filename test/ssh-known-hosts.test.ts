@@ -1,9 +1,31 @@
-// @ts-nocheck
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect } from "vitest";
-import { pruneKnownHostsEntries } from "../dist/lib/onboard";
+import { describe, expect, it } from "vitest";
+
+type OnboardKnownHostsInternals = {
+  pruneKnownHostsEntries: (contents: string) => string;
+};
+
+type OnboardKnownHostsCandidate = {
+  pruneKnownHostsEntries?: unknown;
+  default?: unknown;
+} | null;
+
+function isOnboardKnownHostsInternals(
+  value: OnboardKnownHostsCandidate,
+): value is OnboardKnownHostsInternals {
+  return value !== null && typeof value.pruneKnownHostsEntries === "function";
+}
+
+const loadedOnboardKnownHostsModule = await import("../src/lib/onboard.js");
+const onboardKnownHostsInternals = isOnboardKnownHostsInternals(loadedOnboardKnownHostsModule)
+  ? loadedOnboardKnownHostsModule
+  : null;
+if (!isOnboardKnownHostsInternals(onboardKnownHostsInternals)) {
+  throw new Error("Expected onboard internals to expose pruneKnownHostsEntries");
+}
+const { pruneKnownHostsEntries } = onboardKnownHostsInternals;
 
 describe("pruneKnownHostsEntries", () => {
   it("removes lines with openshell- hostnames", () => {
@@ -92,10 +114,14 @@ describe("pruneKnownHostsEntries", () => {
       "[openshell-sandbox]:2222 ssh-ed25519 AAAA...",
       "github.com ssh-rsa AAAA...",
     ].join("\n");
-    // The host field starts with "[openshell-" which starts with "["
-    // not "openshell-", so this line would be preserved by current logic.
-    // Documenting current behavior — bracket-prefixed entries are kept.
-    const result = pruneKnownHostsEntries(input);
-    expect(result).toBe(input);
+    expect(pruneKnownHostsEntries(input)).toBe("github.com ssh-rsa AAAA...");
+  });
+
+  it("removes marked openshell host entries", () => {
+    const input = [
+      "@cert-authority openshell-sandbox ssh-ed25519 AAAA...",
+      "github.com ssh-rsa AAAA...",
+    ].join("\n");
+    expect(pruneKnownHostsEntries(input)).toBe("github.com ssh-rsa AAAA...");
   });
 });

@@ -210,6 +210,34 @@ describe("commands/migration-state", () => {
       expect(result.errors.some((e) => e.includes("Failed to parse"))).toBe(true);
     });
 
+    // Empty / whitespace-only openclaw.json. Without the read-path guard,
+    // JSON5.parse("") throws "JSON5: invalid end of input at 1:1" (issue
+    // #3118). The guard surfaces a recovery hint instead of leaking the
+    // opaque parser error.
+    it("reports a structured error when config file is empty (0 bytes)", () => {
+      const env = { HOME: "/home/user" };
+      addDir("/home/user/.openclaw");
+      addFile("/home/user/.openclaw/openclaw.json", "");
+      const result = detectHostOpenClaw(env);
+      expect(
+        result.errors.some(
+          (e) => e.toLowerCase().includes("empty") && !e.includes("invalid end of input"),
+        ),
+      ).toBe(true);
+    });
+
+    it("reports a structured error when config file is whitespace-only", () => {
+      const env = { HOME: "/home/user" };
+      addDir("/home/user/.openclaw");
+      addFile("/home/user/.openclaw/openclaw.json", "   \n\t  ");
+      const result = detectHostOpenClaw(env);
+      expect(
+        result.errors.some(
+          (e) => e.toLowerCase().includes("empty") && !e.includes("invalid end of input"),
+        ),
+      ).toBe(true);
+    });
+
     it("reports error when config is an array", () => {
       const env = { HOME: "/home/user" };
       addDir("/home/user/.openclaw");
@@ -905,12 +933,56 @@ describe("commands/migration-state", () => {
         stateDir: "/home/user/.openclaw",
         configPath: null,
         hasExternalConfig: false,
-        externalRoots: [],
-        warnings: [],
+        externalRoots: [
+          {
+            id: "workspace-root",
+            kind: "workspace",
+            label: "Workspace",
+            sourcePath: "/host/workspace",
+            snapshotRelativePath: "external/workspace",
+            sandboxPath: "/sandbox/workspace",
+            symlinkPaths: ["/sandbox/.openclaw/workspace-link"],
+            bindings: [{ configPath: "workspace.path" }],
+          },
+        ],
+        warnings: ["workspace root was remapped"],
       };
       addFile("/snapshots/snap1/snapshot.json", JSON.stringify(manifest));
       const loaded = loadSnapshotManifest("/snapshots/snap1");
       expect(loaded).toEqual(manifest);
+    });
+
+    it("rejects a snapshot manifest whose JSON root is not an object", () => {
+      addFile("/snapshots/snap1/snapshot.json", JSON.stringify(["not", "an", "object"]));
+      expect(() => loadSnapshotManifest("/snapshots/snap1")).toThrow(/Invalid snapshot manifest/);
+    });
+
+    it("rejects malformed externalRoots and warnings entries", () => {
+      addFile(
+        "/snapshots/snap1/snapshot.json",
+        JSON.stringify({
+          version: 2,
+          createdAt: "2026-03-01T00:00:00.000Z",
+          homeDir: "/home/user",
+          stateDir: "/home/user/.openclaw",
+          configPath: null,
+          hasExternalConfig: false,
+          externalRoots: [
+            {
+              id: "workspace-root",
+              kind: "workspace",
+              label: "Workspace",
+              sourcePath: "/host/workspace",
+              snapshotRelativePath: "external/workspace",
+              sandboxPath: "/sandbox/workspace",
+              symlinkPaths: ["/sandbox/.openclaw/workspace-link"],
+              bindings: [1],
+            },
+          ],
+          warnings: [null],
+        }),
+      );
+      expect(() => loadSnapshotManifest("/snapshots/snap1")).toThrow(/Invalid snapshot manifest/);
     });
   });
 
@@ -1446,16 +1518,17 @@ describe("commands/migration-state", () => {
       }
     };
 
-    it.each(["__proto__", "constructor", "prototype"])(
-      "rejects unsafe path segment: %s",
-      (segment) => {
-        const doc: Record<string, unknown> = {};
-        expect(() => {
-          setConfigValue(doc, `${segment}.polluted`, "true");
-        }).toThrow(/Unsafe config path segment/);
-        expectPrototypeClean();
-      },
-    );
+    it.each([
+      "__proto__",
+      "constructor",
+      "prototype",
+    ])("rejects unsafe path segment: %s", (segment) => {
+      const doc: Record<string, unknown> = {};
+      expect(() => {
+        setConfigValue(doc, `${segment}.polluted`, "true");
+      }).toThrow(/Unsafe config path segment/);
+      expectPrototypeClean();
+    });
 
     it("rejects __proto__ in nested position", () => {
       const doc: Record<string, unknown> = {};
@@ -1465,16 +1538,16 @@ describe("commands/migration-state", () => {
       expectPrototypeClean();
     });
 
-    it.each(["foo.prototype.bar", "foo.constructor.bar"])(
-      "rejects unsafe segment in nested path: %s",
-      (configPath) => {
-        const doc: Record<string, unknown> = {};
-        expect(() => {
-          setConfigValue(doc, configPath, "true");
-        }).toThrow(/Unsafe config path segment/);
-        expectPrototypeClean();
-      },
-    );
+    it.each([
+      "foo.prototype.bar",
+      "foo.constructor.bar",
+    ])("rejects unsafe segment in nested path: %s", (configPath) => {
+      const doc: Record<string, unknown> = {};
+      expect(() => {
+        setConfigValue(doc, configPath, "true");
+      }).toThrow(/Unsafe config path segment/);
+      expectPrototypeClean();
+    });
 
     it("allows legitimate dotted paths", () => {
       const doc: Record<string, unknown> = {};

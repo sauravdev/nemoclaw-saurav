@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # NemoClaw — prek hook configuration
 # prek: https://github.com/j178/prek — single binary, no Python required for the runner
 # Installed as an npm devDependency (@j178/prek) — available after `npm install`.
@@ -16,12 +19,17 @@
 # Priority groups (prek runs same-priority hooks in parallel):
 #   0  — General file fixers (whitespace, EOF, line endings)
 #   4  — SPDX header insertion (--fix)
-#   5  — Shell / TS formatters (shfmt, prettier)
-#   6  — Fixes that should follow formatters (ruff check --fix, eslint --fix)
+#   5  — Shell / JS / TS formatters (shfmt, Biome)
+#   6  — Fixes that should follow formatters (ruff check --fix, Biome lint --write)
 #  10  — Linters and read-only checks
 #  20  — Project-level checks (vitest, coverage, ratchet)
 
 exclude: ^(nemoclaw/dist/|nemoclaw/node_modules/|docs/_build/|\.venv/|uv\.lock$)
+
+# Stage-less hooks run only while creating a commit. Hooks for later Git
+# lifecycle stages declare their own `stages` explicitly below.
+default_stages:
+  - pre-commit
 
 # Which git hook shims `prek install` writes (separate from each hook's `stages:`).
 # https://prek.j178.dev/configuration/#default_install_hook_types
@@ -38,11 +46,16 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        exclude: ^skills/[^/]+/skill\.oms\.sig$
+        stages: [pre-commit]
         priority: 0
       - id: end-of-file-fixer
+        exclude: ^skills/[^/]+/skill\.oms\.sig$
+        stages: [pre-commit]
         priority: 0
       - id: mixed-line-ending
         args: ["--fix=lf"]
+        exclude: ^skills/[^/]+/skill\.oms\.sig$
         priority: 0
 
   # ── Priority 0: reject force-added ignored files ───────────────────────────
@@ -70,24 +83,16 @@ repos:
         pass_filenames: true
         priority: 4
 
-  # ── Priority 4: regenerate agent skills when docs change ──────────────────
+  # ── Priority 3: sync generated docs before read-only validation ───────────
   - repo: local
     hooks:
       - id: platform-matrix-sync
         name: Sync platform matrix to docs
-        entry: bash -c 'python3 scripts/generate-platform-docs.py && git add README.md docs/get-started/quickstart.md docs/inference/inference-options.md'
+        entry: bash -c 'python3 scripts/generate-platform-docs.py && git add docs/get-started/prerequisites.mdx docs/inference/inference-options.mdx docs/reference/platform-support.mdx'
         language: system
-        files: ^(ci/platform-matrix\.json|README\.md|docs/get-started/quickstart\.md|docs/inference/inference-options\.md|scripts/generate-platform-docs\.py)$
+        files: ^(ci/platform-matrix\.json|docs/get-started/prerequisites\.mdx|docs/inference/inference-options\.mdx|docs/reference/platform-support\.mdx|scripts/generate-platform-docs\.py)$
         pass_filenames: false
         priority: 3
-
-      - id: docs-to-skills
-        name: Regenerate agent skills from docs
-        entry: bash -c 'python3 scripts/docs-to-skills.py docs/ .agents/skills/ --prefix nemoclaw-user && git add .agents/skills/'
-        language: system
-        files: ^(docs/.*\.md$|ci/platform-matrix\.json$|scripts/generate-platform-docs\.py$)
-        pass_filenames: false
-        priority: 4
 
   # ── Priority 5: formatters ────────────────────────────────────────────────
   - repo: https://github.com/scop/pre-commit-shfmt
@@ -100,44 +105,27 @@ repos:
           - "2"
           - -ci
           - -bn
+        stages: [pre-commit]
         priority: 5
 
   - repo: local
     hooks:
-      - id: prettier-plugin
-        name: Prettier (plugin)
-        entry: bash -c 'root="$(git rev-parse --show-toplevel)" && cd "$root/nemoclaw" && files=() && for f in "$@"; do files+=("${f#nemoclaw/}"); done && npx prettier --write "${files[@]}"' --
+      - id: biome-format
+        name: Biome format
+        entry: npx biome format --write --no-errors-on-unmatched
         language: system
-        files: ^nemoclaw/.*\.ts$
-        pass_filenames: true
-        priority: 5
-
-      - id: prettier-js
-        name: Prettier (JavaScript)
-        entry: npx prettier --write
-        language: system
-        files: ^(bin|test)/.*\.js$
+        files: ^(biome\.json|package(-lock)?\.json|nemoclaw/package(-lock)?\.json|commitlint\.config\.js|bin/.*\.js|scripts/.*\.js|test/.*\.js|.*\.ts)$
         pass_filenames: true
         priority: 5
 
   # ── Priority 6: auto-fix after formatting ─────────────────────────────────
   - repo: local
     hooks:
-      - id: eslint-plugin
-        name: ESLint (plugin)
-        entry: bash -c 'root="$(git rev-parse --show-toplevel)" && cd "$root/nemoclaw" && files=() && for f in "$@"; do files+=("${f#nemoclaw/}"); done && npx eslint --fix "${files[@]}"' --
+      - id: biome-lint-fix
+        name: Biome lint fixes
+        entry: npx biome lint --write
         language: system
-        files: ^nemoclaw/.*\.ts$
-        pass_filenames: true
-        priority: 6
-
-  - repo: local
-    hooks:
-      - id: eslint-cli
-        name: ESLint (CLI)
-        entry: npx eslint --fix
-        language: system
-        files: ^(bin|test|scripts|docs/_ext)/.*\.js$
+        files: ^(commitlint\.config\.js|bin/.*\.js|scripts/.*\.js|test/.*\.js|docs/_ext/.*\.js|.*\.ts)$
         pass_filenames: true
         priority: 6
 
@@ -149,6 +137,7 @@ repos:
         priority: 10
       - id: check-added-large-files
         args: ["--maxkb=2000"]
+        stages: [pre-commit]
         priority: 10
       - id: check-case-conflict
         priority: 10
@@ -161,8 +150,10 @@ repos:
       - id: detect-private-key
         priority: 10
       - id: check-executables-have-shebangs
+        stages: [pre-commit]
         priority: 10
       - id: check-shebang-scripts-are-executable
+        stages: [pre-commit]
         priority: 10
 
   - repo: local
@@ -173,6 +164,25 @@ repos:
         language: system
         pass_filenames: false
         files: ^(nemoclaw-blueprint/.*\.yaml$|nemoclaw/openclaw\.plugin\.json$|schemas/.*\.json$)
+        priority: 10
+
+      - id: repository-checks
+        name: Repository checks
+        entry: npm run checks
+        language: system
+        files: ^(bin/.*\.(cjs|js|mjs)$|src/.*\.tsx?$|scripts/.*\.(cjs|js|mjs|ts|tsx)$|test/.*\.(cjs|js|mjs|ts|tsx)$|nemoclaw/src/.*\.tsx?$)
+        pass_filenames: false
+        priority: 10
+
+      - id: env-var-docs
+        name: NEMOCLAW_* env-var documentation gate
+        entry: npx tsx scripts/check-env-var-docs.ts
+        language: system
+        # Triggers the audit when src/, bin/, the docs file, the allowlist,
+        # or the gate script itself changes. The script always rescans the
+        # whole repo so pass_filenames is false. See #3184.
+        files: ^(src/.*\.(ts|tsx|js)|bin/.*\.(ts|js)|docs/reference/commands\.mdx|ci/env-var-doc-allowlist\.json|scripts/check-env-var-docs\.ts)$
+        pass_filenames: false
         priority: 10
 
   - repo: https://github.com/shellcheck-py/shellcheck-py
@@ -239,8 +249,8 @@ repos:
         entry: npx tsc -p tsconfig.cli.json
         language: system
         pass_filenames: false
-        files: ^(bin|scripts)/
-        types_or: [ts, tsx]
+        files: ^(bin|scripts|src|test|nemoclaw-blueprint/scripts)/.*\.(ts|tsx)$|^tsconfig\.cli\.json$
+        always_run: true
         stages: [pre-push]
         priority: 10
 
@@ -274,18 +284,36 @@ repos:
     hooks:
       - id: test-cli
         name: Test (CLI)
-        entry: bash -c 'npm run build:cli && npx vitest run --project cli --coverage --coverage.reporter=text --coverage.reporter=json-summary --coverage.reportsDirectory=coverage/cli --coverage.include="bin/**/*.js" --coverage.include="dist/lib/**/*.js" --coverage.exclude="test/**/*.js" --coverage.exclude="test/**/*.ts" && npx tsx scripts/check-coverage-ratchet.ts coverage/cli/coverage-summary.json ci/coverage-threshold-cli.json "CLI coverage"'
+        entry: >-
+          bash -c 'node -e "require(\"node:fs\").rmSync(\"dist\", { recursive: true, force: true })" && npm run build:cli && npx tsx scripts/check-dist-sourcemaps.ts dist && npx vitest run --project cli --project integration --coverage --coverage.reporter=text-summary --coverage.reporter=json-summary --coverage.reportsDirectory=coverage/cli --coverage.include="bin/**/*.js" --coverage.include="src/**/*.ts" --coverage.exclude="test/**/*.js" --coverage.exclude="test/**/*.ts" && npx tsx scripts/check-coverage-ratchet.ts coverage/cli/coverage-summary.json ci/coverage-threshold-cli.json "CLI coverage"'
         language: system
         pass_filenames: false
-        files: ^(bin/|src/|test/)
+        files: ^(bin/|src/.*\.(ts|tsx|js|mjs|cjs)$|test/.*\.(ts|tsx|js|mjs|cjs)$)
+        require_serial: true
         priority: 20
 
       - id: test-plugin
         name: Test (plugin)
-        entry: bash -c 'npx vitest run --project plugin --coverage --coverage.reporter=text --coverage.reporter=json-summary --coverage.reportsDirectory=coverage/plugin --coverage.include="nemoclaw/src/**/*.ts" --coverage.exclude="**/*.test.ts" && npx tsx scripts/check-coverage-ratchet.ts coverage/plugin/coverage-summary.json ci/coverage-threshold-plugin.json "Plugin coverage"'
+        entry: bash -c 'npx vitest run --project plugin --coverage --coverage.reporter=text-summary --coverage.reporter=json-summary --coverage.reportsDirectory=coverage/plugin --coverage.include="nemoclaw/src/**/*.ts" --coverage.exclude="**/*.test.ts" && npx tsx scripts/check-coverage-ratchet.ts coverage/plugin/coverage-summary.json ci/coverage-threshold-plugin.json "Plugin coverage"'
         language: system
         pass_filenames: false
         files: ^nemoclaw/
+        priority: 20
+
+      - id: source-shape-test-budget
+        name: Source-shape test budget
+        entry: npm run source-shape:check
+        language: system
+        pass_filenames: false
+        files: ^(test/|scripts/find-source-shape-tests\.ts$|ci/source-shape-test-budget\.json$)
+        priority: 20
+
+      - id: test-file-size-budget
+        name: Test file size budget
+        entry: npm run test-size:check
+        language: system
+        pass_filenames: false
+        files: ^(test/|src/.*\.(test|spec)\.(ts|js|mts|mjs|cts|cjs)$|nemoclaw/src/.*\.(test|spec)\.(ts|js|mts|mjs|cts|cjs)$|scripts/check-test-file-size-budget\.ts$|ci/test-file-size-budget\.json$)
         priority: 20
 
       - id: test-skills-yaml
@@ -293,7 +321,7 @@ repos:
         entry: npx vitest run test/skills-frontmatter.test.ts
         language: system
         pass_filenames: false
-        files: ^(\.agents/skills/|docs/.*\.md$|scripts/docs-to-skills\.py$|test/skills-frontmatter\.test\.js$)
+        files: ^(\.agents/skills/|skills/|test/skills-frontmatter\.test\.ts$)
         priority: 20
 
 default_language_version:

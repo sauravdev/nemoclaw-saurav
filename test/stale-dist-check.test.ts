@@ -20,7 +20,15 @@ function writeFile(p: string, content: string, mtimeMs: number) {
   fs.utimesSync(p, t, t);
 }
 
-type Stream = { write(chunk: string): unknown };
+type Stream = { write(chunk: string): void | boolean };
+
+function requireStaleResult(result: ReturnType<typeof checkStaleDist>) {
+  expect(result).not.toBeNull();
+  if (!result) {
+    throw new Error("Expected stale dist result to be present");
+  }
+  return result;
+}
 
 describe("stale-dist-check", () => {
   let root = "";
@@ -42,9 +50,8 @@ describe("stale-dist-check", () => {
   it("flags stale when src is newer than dist", () => {
     writeFile(path.join(root, "dist", "lib", "foo.js"), "x", 1_000_000);
     writeFile(path.join(root, "src", "lib", "foo.ts"), "x", 5_000_000);
-    const result = checkStaleDist(root);
-    expect(result).not.toBeNull();
-    expect(result!.srcMtime).toBeGreaterThan(result!.distMtime);
+    const result = requireStaleResult(checkStaleDist(root));
+    expect(result.srcMtime).toBeGreaterThan(result.distMtime);
   });
 
   it("ignores .test.ts files (they do not ship to dist/)", () => {
@@ -73,11 +80,15 @@ describe("stale-dist-check", () => {
     expect(checkStaleDist(root)).toBeNull();
   });
 
-  it("warnIfStale writes a build:cli hint mentioning #1958", () => {
+  it("writes a build:cli hint mentioning the tracked issue in warnIfStale (#1958)", () => {
     writeFile(path.join(root, "dist", "lib", "foo.js"), "x", 1_000_000);
     writeFile(path.join(root, "src", "lib", "foo.ts"), "x", 5_000_000);
     const chunks: string[] = [];
-    const stream: Stream = { write: (chunk: string) => chunks.push(chunk) };
+    const stream: Stream = {
+      write: (chunk: string) => {
+        chunks.push(chunk);
+      },
+    };
     expect(warnIfStale(root, stream)).toBe(true);
     const output = chunks.join("");
     expect(output).toContain("npm run build:cli");
