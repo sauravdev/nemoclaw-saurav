@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: macos-e2e
+name: E2E / macOS
 
 on:
   workflow_dispatch:
@@ -40,10 +40,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Setup Node.js
-        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "22"
           cache: npm
@@ -70,8 +70,11 @@ jobs:
           npm ci --ignore-scripts
           npm run build
 
-      - name: Run vitest suite
-        run: npx vitest run --testTimeout 60000
+      - name: Run gateway lifecycle regressions
+        run: >-
+          npx vitest run --project integration
+          test/tunnel-gateway-port-release-runtime.test.ts
+          test/onboard-gateway-prelaunch-cutover.test.ts
 
       - name: Detect Docker availability
         id: docker
@@ -88,23 +91,24 @@ jobs:
       - name: Run macOS full E2E
         if: steps.docker.outputs.docker_ok == 'true'
         env:
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_INFERENCE_API_KEY: ${{ secrets.NVIDIA_INFERENCE_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
           NEMOCLAW_NON_INTERACTIVE: "1"
           NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE: "1"
           NEMOCLAW_RECREATE_SANDBOX: "1"
           NEMOCLAW_SANDBOX_NAME: "e2e-macos"
-        run: bash test/e2e/test-full-e2e.sh
+        run: |
+          NEMOCLAW_RUN_LIVE_E2E=1 npx vitest run --project e2e-live test/e2e/live/full-e2e.test.ts --silent=false --reporter=default
 
       - name: Explain skipped full E2E
         if: steps.docker.outputs.docker_ok != 'true'
         run: |
           echo 'Skipping macOS full E2E because Docker is unavailable on this runner.'
-          echo 'The workflow still validated the NemoClaw build and vitest suite on macOS (Apple Silicon).'
+          echo 'The workflow still validated the NemoClaw build on macOS (Apple Silicon).'
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-e2e-logs
           path: |

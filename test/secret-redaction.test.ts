@@ -1,38 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import {
-  SECRET_PATTERNS,
-  EXPECTED_SHELL_PREFIXES,
-} from "../src/lib/secret-patterns";
-import { redact as debugRedact } from "../src/lib/debug";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 // runner.ts uses CJS exports — import via dist
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { redact as debugRedact } from "../src/lib/diagnostics/debug";
+import { redactSensitiveText } from "../src/lib/state/onboard-session";
 
 const require = createRequire(import.meta.url);
-const { redact: runnerRedact } = require("../dist/lib/runner");
-
-const DEBUG_SH = readFileSync(
-  join(import.meta.dirname, "..", "scripts", "debug.sh"),
-  "utf-8",
-);
-
-const RUNNER_TS = readFileSync(
-  join(import.meta.dirname, "..", "src", "lib", "runner.ts"),
-  "utf-8",
-);
-
-const DEBUG_TS = readFileSync(
-  join(import.meta.dirname, "..", "src", "lib", "debug.ts"),
-  "utf-8",
-);
+const { redact: runnerRedact } = require("../src/lib/runner");
 
 describe("secret redaction consistency (#1736)", () => {
-  // Test tokens that MUST be redacted by all three modules
-  const TEST_TOKENS = [
+  // Tokens whose prefix is a literal string that must be redacted by the shared debug redactor.
+  const LITERAL_PREFIX_TOKENS = [
     { name: "NVIDIA API key", token: "nvapi-" + "a".repeat(30) },
     { name: "NVIDIA Cloud Functions", token: "nvcf-" + "b".repeat(30) },
     { name: "GitHub PAT (classic)", token: "ghp_" + "c".repeat(36) },
@@ -40,14 +24,35 @@ describe("secret redaction consistency (#1736)", () => {
       name: "GitHub PAT (fine-grained)",
       token: "github_pat_" + "d".repeat(50),
     },
+    { name: "Tavily API key", token: "tvly-" + "e".repeat(30) },
+    {
+      name: "LangSmith personal access token",
+      token: `lsv2_pt_${"f".repeat(36)}_${"g".repeat(10)}`,
+    },
+    {
+      name: "LangSmith service key",
+      token: `lsv2_sk_${"h".repeat(36)}_${"i".repeat(10)}`,
+    },
   ];
+
+  // Tokens added for messaging integrations (#2336). They are covered by
+  // the shared runner/debug TypeScript redactors.
+  const MESSAGING_TOKENS = [
+    { name: "Slack bot token", token: "xoxb-" + "1".repeat(12) + "-" + "e".repeat(24) },
+    { name: "Slack app token", token: "xapp-" + "1".repeat(12) + "-" + "f".repeat(24) },
+    { name: "Telegram bot token", token: "1234567890:" + "A".repeat(35) },
+    {
+      name: "Discord bot token",
+      token: "g".repeat(24) + "." + "h".repeat(6) + "." + "i".repeat(27),
+    },
+  ];
+
+  const TEST_TOKENS = [...LITERAL_PREFIX_TOKENS, ...MESSAGING_TOKENS];
 
   describe("runner.ts redacts all token types", () => {
     for (const { name, token } of TEST_TOKENS) {
       it(`redacts ${name}`, () => {
-        const text = runnerRedact(
-          `error: authentication failed with ${token}`,
-        );
+        const text = runnerRedact(`error: authentication failed with ${token}`);
         expect(text).not.toContain(token);
       });
     }
@@ -56,46 +61,152 @@ describe("secret redaction consistency (#1736)", () => {
   describe("debug.ts redacts all token types", () => {
     for (const { name, token } of TEST_TOKENS) {
       it(`redacts ${name}`, () => {
-        const text = debugRedact(
-          `error: authentication failed with ${token}`,
-        );
+        const text = debugRedact(`error: authentication failed with ${token}`);
         expect(text).not.toContain(token);
       });
     }
   });
 
-  describe("runner.ts imports from secret-patterns.ts", () => {
-    it("uses the shared module", () => {
-      expect(RUNNER_TS).toContain("secret-patterns");
+  describe("redactor consistency (#2381)", () => {
+    it("runner and debug redactors both mask shared token patterns", () => {
+      const text = "provider failed with NVIDIA_INFERENCE_API_KEY=nvapi-" + "a".repeat(30);
+      expect(runnerRedact(text)).not.toContain("nvapi-");
+      expect(debugRedact(text)).not.toContain("nvapi-");
+    });
+
+    it("redacts complete multi-segment LangSmith keys without exposing their tails", () => {
+      const token = `lsv2_pt_${"a".repeat(36)}_${"tail".repeat(3)}`;
+      for (const redactor of [runnerRedact, debugRedact, redactSensitiveText]) {
+        const redacted = redactor(`provider failed with ${token}`);
+        expect(redacted).not.toContain(token);
+        expect(redacted).not.toContain("_tailtailtail");
+      }
     });
   });
 
-  describe("debug.ts imports from secret-patterns.ts", () => {
-    it("uses the shared module", () => {
-      expect(DEBUG_TS).toContain("secret-patterns");
-    });
-  });
-
-  describe("debug.sh includes all token prefixes", () => {
-    for (const prefix of EXPECTED_SHELL_PREFIXES) {
-      it(`includes ${prefix} pattern`, () => {
-        expect(DEBUG_SH).toContain(prefix);
-      });
-    }
-  });
-
-  describe("debug.sh redact() function handles all token types", () => {
-    for (const { name, token } of TEST_TOKENS) {
-      it(`redacts ${name}`, () => {
-        // Extract the redact function's sed patterns and verify they match
-        const redactFn = DEBUG_SH.match(
-          /redact\(\) \{[\s\S]*?^\}/m,
+  describe("debug.sh delegates to node when available (#2381)", () => {
+    it("redacts diagnostic command output with the compiled redactor", () => {
+      const tmp = mkdtempSync(join(tmpdir(), "nemoclaw-debug-redact-"));
+      const fakeBin = join(tmp, "bin");
+      mkdirSync(fakeBin);
+      writeFileSync(
+        join(fakeBin, "date"),
+        "#!/bin/sh\necho NVIDIA_INFERENCE_API_KEY=nvapi-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        { mode: 0o755 },
+      );
+      try {
+        const result = spawnSync(
+          "bash",
+          [join(import.meta.dirname, "..", "scripts", "debug.sh"), "--quick"],
+          {
+            encoding: "utf-8",
+            env: {
+              ...process.env,
+              NEMOCLAW_NODE: process.execPath,
+              TMPDIR: tmp,
+              PATH: `${fakeBin}:${process.env.PATH || ""}`,
+            },
+            timeout: 30_000,
+          },
         );
-        expect(redactFn).toBeTruthy();
-        // The token prefix should appear in a sed expression
-        const prefix = token.split(/[A-Za-z0-9]{10}/)[0];
-        expect(redactFn![0]).toContain(prefix);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain("NVIDIA_INFERENCE_API_KEY=<REDACTED>");
+        expect(result.stdout).not.toContain("nvapi-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    }, 40_000);
+  });
+
+  describe("debug.sh wrapper locates node from env", () => {
+    it("uses NEMOCLAW_NODE and the compiled redactor when node is absent from PATH", () => {
+      const tmp = mkdtempSync(join(tmpdir(), "nemoclaw-debug-node-env-redact-"));
+      const fakeBin = join(tmp, "bin");
+      mkdirSync(fakeBin);
+      for (const name of [
+        "cat",
+        "dmesg",
+        "free",
+        "head",
+        "ps",
+        "sh",
+        "sort",
+        "tail",
+        "uname",
+        "uptime",
+      ]) {
+        try {
+          const target = spawnSync("bash", ["--noprofile", "--norc", "-c", `command -v ${name}`], {
+            encoding: "utf-8",
+          }).stdout.trim();
+          if (target) symlinkSync(target, join(fakeBin, name));
+        } catch {
+          /* ignore optional command */
+        }
+      }
+      writeFileSync(
+        join(fakeBin, "date"),
+        "#!/bin/sh\necho nvapi-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb sk-cccccccccccccccccccccccc\n",
+        { mode: 0o755 },
+      );
+      try {
+        const result = spawnSync(
+          "/bin/bash",
+          [join(import.meta.dirname, "..", "scripts", "debug.sh"), "--quick"],
+          {
+            encoding: "utf-8",
+            env: {
+              ...process.env,
+              NEMOCLAW_NODE: process.execPath,
+              TMPDIR: tmp,
+              PATH: fakeBin,
+            },
+            timeout: 30_000,
+          },
+        );
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain("<REDACTED>");
+        expect(result.stdout).not.toContain("nvapi-");
+        expect(result.stdout).not.toContain("ghp_");
+        expect(result.stdout).not.toContain("sk-cccc");
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("onboard-session redactSensitiveText (#2336)", () => {
+    for (const { name, token } of TEST_TOKENS) {
+      it(`redacts ${name} from persisted failure messages`, () => {
+        const text = redactSensitiveText(`onboard step failed: provider returned ${token}`);
+        expect(text).not.toContain(token);
       });
     }
+
+    it("redacts Telegram token embedded in API URL path", () => {
+      const token = "1234567890:" + "A".repeat(35);
+      const text = redactSensitiveText(
+        `Failed to reach https://api.telegram.org/bot${token}/getMe`,
+      );
+      expect(text).not.toContain(token);
+    });
+
+    it("redacts Slack env-var assignments", () => {
+      const text = redactSensitiveText("SLACK_BOT_TOKEN=xoxb-notreal SLACK_APP_TOKEN=xapp-notreal");
+      expect(text).not.toContain("xoxb-notreal");
+      expect(text).not.toContain("xapp-notreal");
+    });
+
+    it("redacts Deep Agents provider-key env-var assignments", () => {
+      const text = redactSensitiveText("NEMOCLAW_PROVIDER_KEY=sk-test-inference-hub-key");
+      expect(text).not.toContain("sk-test-inference-hub-key");
+      expect(text).toBe("NEMOCLAW_PROVIDER_KEY=<REDACTED>");
+    });
+
+    it("redacts TAVILY_API_KEY env-var assignments", () => {
+      const text = redactSensitiveText("TAVILY_API_KEY=tvly-redaction-regression-12345");
+      expect(text).not.toContain("tvly-redaction-regression-12345");
+      expect(text).toBe("TAVILY_API_KEY=<REDACTED>");
+    });
   });
 });

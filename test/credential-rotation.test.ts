@@ -1,28 +1,94 @@
-// @ts-nocheck
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it, vi, beforeEach } from "vitest";
 import { createRequire } from "node:module";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const require = createRequire(import.meta.url);
 
+type ModuleProperty = string | number | boolean | Function | object | null | undefined;
+type ModuleRecord = { [key: string]: ModuleProperty };
+
+type MessagingProvider = {
+  name: string;
+  envKey: string;
+  token: string | null;
+};
+
+type CredentialRotationInternals = {
+  hashCredential: (value: string | null | undefined) => string | null;
+  detectMessagingCredentialRotation: (
+    sandboxName: string,
+    providers: MessagingProvider[],
+  ) => { changed: boolean; changedProviders: string[] };
+};
+
+function isRecord(value: object | null): value is ModuleRecord {
+  return value !== null && !Array.isArray(value);
+}
+
+function isCredentialRotationInternals(value: object | null): value is CredentialRotationInternals {
+  return (
+    isRecord(value) &&
+    typeof value.hashCredential === "function" &&
+    typeof value.detectMessagingCredentialRotation === "function"
+  );
+}
+
+function isRegistryModule(
+  value: object | null,
+): value is typeof import("../src/lib/state/registry.js") {
+  return isRecord(value) && typeof value.getSandbox === "function";
+}
+
+function loadCredentialRotationInternals(): CredentialRotationInternals {
+  const loaded = require("../src/lib/onboard.js");
+  const record = typeof loaded === "object" && loaded !== null ? loaded : null;
+  if (!isCredentialRotationInternals(record)) {
+    throw new Error("Expected onboard internals to expose credential rotation helpers");
+  }
+  return record;
+}
+
+function loadRegistryModule(): typeof import("../src/lib/state/registry.js") {
+  const loaded = require("../src/lib/state/registry.js");
+  const record = typeof loaded === "object" && loaded !== null ? loaded : null;
+  if (!isRegistryModule(record)) {
+    throw new Error("Expected registry module to expose getSandbox");
+  }
+  return record;
+}
+
 describe("credential rotation detection", () => {
-  let hashCredential;
-  let detectMessagingCredentialRotation;
-  let registry;
+  let hashCredential: CredentialRotationInternals["hashCredential"];
+  let detectMessagingCredentialRotation: CredentialRotationInternals["detectMessagingCredentialRotation"];
+  let registry: typeof import("../src/lib/state/registry.js");
 
   beforeEach(() => {
     // Fresh imports to avoid cross-test contamination
-    ({ hashCredential, detectMessagingCredentialRotation } = require("../dist/lib/onboard.js"));
-    registry = require("../dist/lib/registry.js");
+    ({ hashCredential, detectMessagingCredentialRotation } = loadCredentialRotationInternals());
+    registry = loadRegistryModule();
   });
+
+  function hashCredentialOrThrow(value: string): string {
+    const hash = hashCredential(value);
+    expect(hash).not.toBeNull();
+    if (!hash) {
+      throw new Error(`Expected hashCredential(${JSON.stringify(value)}) to return a hash`);
+    }
+    return hash;
+  }
 
   describe("hashCredential", () => {
     it("returns null for falsy values", () => {
       expect(hashCredential(null)).toBeNull();
       expect(hashCredential("")).toBeNull();
       expect(hashCredential(undefined)).toBeNull();
+    });
+
+    it("returns null for whitespace-only values", () => {
+      expect(hashCredential("   ")).toBeNull();
+      expect(hashCredential("\r\n\t")).toBeNull();
     });
 
     it("returns a 64-char hex SHA-256 hash for valid input", () => {
@@ -49,12 +115,44 @@ describe("credential rotation detection", () => {
     });
   });
 
+  function makePlanEntry(
+    name: string,
+    bindings: Array<{ providerEnvKey: string; credentialHash?: string }>,
+  ) {
+    return {
+      name,
+      messaging: {
+        schemaVersion: 1 as const,
+        plan: {
+          schemaVersion: 1 as const,
+          sandboxName: name,
+          agent: "openclaw" as const,
+          workflow: "onboard" as const,
+          channels: [],
+          disabledChannels: [],
+          credentialBindings: bindings.map((b) => ({
+            channelId: "telegram" as const,
+            credentialId: "telegramBotToken",
+            sourceInput: "botToken",
+            providerName: `${name}-telegram-bridge`,
+            providerEnvKey: b.providerEnvKey,
+            placeholder: `openshell:resolve:env:${b.providerEnvKey}`,
+            credentialAvailable: true,
+            ...(b.credentialHash ? { credentialHash: b.credentialHash } : {}),
+          })),
+          networkPolicy: { presets: [], entries: [] },
+          agentRender: [],
+          buildSteps: [],
+          stateUpdates: [],
+          healthChecks: [],
+        },
+      },
+    };
+  }
+
   describe("detectMessagingCredentialRotation", () => {
-    it("returns changed: false when no hashes are stored (legacy sandbox)", () => {
-      vi.spyOn(registry, "getSandbox").mockReturnValue({
-        name: "test-sandbox",
-        // no providerCredentialHashes
-      });
+    it("returns changed: false when no plan is stored (pre-plan sandbox)", () => {
+      vi.spyOn(registry, "getSandbox").mockReturnValue({ name: "test-sandbox" });
 
       const result = detectMessagingCredentialRotation("test-sandbox", [
         { name: "test-telegram-bridge", envKey: "TELEGRAM_BOT_TOKEN", token: "new-token" },
@@ -66,11 +164,12 @@ describe("credential rotation detection", () => {
     });
 
     it("returns changed: false when hashes match", () => {
-      const tokenHash = hashCredential("same-token");
-      vi.spyOn(registry, "getSandbox").mockReturnValue({
-        name: "test-sandbox",
-        providerCredentialHashes: { TELEGRAM_BOT_TOKEN: tokenHash },
-      });
+      const tokenHash = hashCredentialOrThrow("same-token");
+      vi.spyOn(registry, "getSandbox").mockReturnValue(
+        makePlanEntry("test-sandbox", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: tokenHash },
+        ]),
+      );
 
       const result = detectMessagingCredentialRotation("test-sandbox", [
         { name: "test-telegram-bridge", envKey: "TELEGRAM_BOT_TOKEN", token: "same-token" },
@@ -82,11 +181,12 @@ describe("credential rotation detection", () => {
     });
 
     it("returns changed: true with correct provider names when hashes differ", () => {
-      const oldHash = hashCredential("old-token");
-      vi.spyOn(registry, "getSandbox").mockReturnValue({
-        name: "test-sandbox",
-        providerCredentialHashes: { TELEGRAM_BOT_TOKEN: oldHash },
-      });
+      const oldHash = hashCredentialOrThrow("old-token");
+      vi.spyOn(registry, "getSandbox").mockReturnValue(
+        makePlanEntry("test-sandbox", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: oldHash },
+        ]),
+      );
 
       const result = detectMessagingCredentialRotation("test-sandbox", [
         { name: "test-telegram-bridge", envKey: "TELEGRAM_BOT_TOKEN", token: "new-token" },
@@ -98,15 +198,14 @@ describe("credential rotation detection", () => {
     });
 
     it("detects rotation across multiple providers", () => {
-      const telegramHash = hashCredential("tg-old");
-      const discordHash = hashCredential("dc-same");
-      vi.spyOn(registry, "getSandbox").mockReturnValue({
-        name: "test-sandbox",
-        providerCredentialHashes: {
-          TELEGRAM_BOT_TOKEN: telegramHash,
-          DISCORD_BOT_TOKEN: discordHash,
-        },
-      });
+      const telegramHash = hashCredentialOrThrow("tg-old");
+      const discordHash = hashCredentialOrThrow("dc-same");
+      vi.spyOn(registry, "getSandbox").mockReturnValue(
+        makePlanEntry("test-sandbox", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: telegramHash },
+          { providerEnvKey: "DISCORD_BOT_TOKEN", credentialHash: discordHash },
+        ]),
+      );
 
       const result = detectMessagingCredentialRotation("test-sandbox", [
         { name: "test-telegram-bridge", envKey: "TELEGRAM_BOT_TOKEN", token: "tg-new" },
@@ -118,19 +217,20 @@ describe("credential rotation detection", () => {
       vi.restoreAllMocks();
     });
 
-    it("skips providers with null tokens", () => {
-      const hash = hashCredential("old-token");
-      vi.spyOn(registry, "getSandbox").mockReturnValue({
-        name: "test-sandbox",
-        providerCredentialHashes: { TELEGRAM_BOT_TOKEN: hash },
-      });
+    it("treats removed tokens as changed providers", () => {
+      const hash = hashCredentialOrThrow("old-token");
+      vi.spyOn(registry, "getSandbox").mockReturnValue(
+        makePlanEntry("test-sandbox", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: hash },
+        ]),
+      );
 
       const result = detectMessagingCredentialRotation("test-sandbox", [
         { name: "test-telegram-bridge", envKey: "TELEGRAM_BOT_TOKEN", token: null },
       ]);
 
-      expect(result.changed).toBe(false);
-      expect(result.changedProviders).toEqual([]);
+      expect(result.changed).toBe(true);
+      expect(result.changedProviders).toEqual(["test-telegram-bridge"]);
       vi.restoreAllMocks();
     });
 

@@ -1,15 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it, vi } from "vitest";
 import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   buildVersionedUninstallUrl,
-  exitWithSpawnResult,
   resolveUninstallScript,
   runUninstallCommand,
-} from "../../dist/lib/uninstall-command";
+} from "./uninstall-command";
+
+function exitWithCode(code: number): never {
+  throw new Error(`exit:${code}`);
+}
 
 describe("uninstall command", () => {
   it("builds a version-pinned uninstall URL", () => {
@@ -26,17 +29,6 @@ describe("uninstall command", () => {
     expect(script).toBe("/b");
   });
 
-  it("maps spawn signals to shell-style exit codes", () => {
-    expect(() =>
-      exitWithSpawnResult(
-        { status: null, signal: "SIGTERM" },
-        ((code: number) => {
-          throw new Error(`exit:${code}`);
-        }) as never,
-      ),
-    ).toThrow("exit:143");
-  });
-
   it("runs the local uninstall script when present", () => {
     const spawnSyncImpl = vi.fn(() => ({ status: 0, signal: null }));
     expect(() =>
@@ -50,16 +42,18 @@ describe("uninstall command", () => {
         existsSyncImpl: (candidate) => candidate === path.join("/repo", "uninstall.sh"),
         log: () => {},
         error: () => {},
-        exit: ((code: number) => {
-          throw new Error(`exit:${code}`);
-        }) as never,
+        exit: exitWithCode,
       }),
     ).toThrow("exit:0");
-    expect(spawnSyncImpl).toHaveBeenCalledWith("bash", [path.join("/repo", "uninstall.sh"), "--yes"], {
-      stdio: "inherit",
-      cwd: "/repo",
-      env: process.env,
-    });
+    expect(spawnSyncImpl).toHaveBeenCalledWith(
+      "bash",
+      [path.join("/repo", "uninstall.sh"), "--yes"],
+      {
+        stdio: "inherit",
+        cwd: "/repo",
+        env: process.env,
+      },
+    );
   });
 
   it("does not download or run a remote uninstall script when no local copy exists", () => {
@@ -78,9 +72,7 @@ describe("uninstall command", () => {
         error: (message) => {
           errors.push(message ?? "");
         },
-        exit: ((code: number) => {
-          throw new Error(`exit:${code}`);
-        }) as never,
+        exit: exitWithCode,
       }),
     ).toThrow("exit:1");
     expect(spawnSyncImpl).not.toHaveBeenCalled();
